@@ -1,0 +1,5 @@
+{
+  "project-name": "Timeless",
+  "project-oneliner": "AI browser agents that QA-test your web app in the cloud — watch them live.",
+  "project-description": "Timeless lets companies register their web apps and create AI QA agents that test specific features in real cloud browsers. Each agent runs on its own AWS Bedrock AgentCore Runtime (a Strands agent with a selectable model) that drives a managed browser via Playwright — streaming step-by-step pass/fail results, screenshots, and full rrweb session replays, with per-agent memory that compounds across runs. Built with Next.js 16 + Supabase, deployed on Vercel."
+}
