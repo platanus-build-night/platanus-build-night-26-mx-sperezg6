@@ -39,6 +39,9 @@ export async function createAgentRuntime(opts: {
     AWS_REGION: process.env.AWS_REGION ?? "us-east-1",
     BEDROCK_MODEL_ID: opts.modelId,
     AGENT_INSTRUCTIONS: opts.instructions || "",
+    // When set, the agent + report use the Anthropic Claude API directly
+    // (separate quota) instead of Bedrock — avoids the per-day token cap.
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
   };
 
   // Runtime names must be <= ~48 chars, alnum + underscore.

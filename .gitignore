@@ -53,3 +53,4 @@ agent-service/.bedrock_agentcore.yaml
 # tooling caches
 .playwright-cli/
 dependencies.hash
+agent-service/.venv/

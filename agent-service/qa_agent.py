@@ -21,8 +21,9 @@ from datetime import datetime, timezone
 
 import boto3
 from bedrock_agentcore.tools.browser_client import BrowserClient
-from playwright.sync_api import sync_playwright
 from supabase import create_client
+
+from pw_driver import PWDriver
 
 
 def _now() -> str:
@@ -110,26 +111,29 @@ def run_spec(sb, dp, region, browser_id, memory_id, run_spec, company_actor, ses
     outcome = "passed"
     executed: list[dict] = []  # what the agent actually did, for the report
     ws_url, ws_headers = bc.generate_ws_headers()
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(ws_url, headers=ws_headers)
-        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
+    # All Playwright ops run on the driver's single dedicated thread (sync API is
+    # thread-bound; Strands runs tools on worker threads → greenlet errors otherwise).
+    drv = PWDriver()
+    drv.start(ws_url, ws_headers)
+    try:
         for i, step in enumerate(steps):
+            print(f"\n[step {i}/{len(steps)-1}] {step['description']!r}  url={drv.url}", flush=True)
             sb.table("run_steps").update({"status": "running", "started_at": _now()}).eq("id", step_ids[i]).execute()
-            ok, log = run_one_step(page, step["description"], model_id, region)
-            shot = _screenshot(page, sb, spec_id, i)
+            ok, log = run_one_step(drv, step["description"], model_id, region)
+            shot = _screenshot(drv, sb, spec_id, i)
+            print(f"[step {i}] {'PASS' if ok else 'FAIL'}  url={drv.url}\n{log}", flush=True)
             executed.append({"description": step["description"], "status": "passed" if ok else "failed", "log": log})
-            if ok:
-                sb.table("run_steps").update({
-                    "status": "passed", "ended_at": _now(), "screenshot_url": shot,
-                }).eq("id", step_ids[i]).execute()
-            else:
-                sb.table("run_steps").update({
-                    "status": "failed", "ended_at": _now(), "screenshot_url": shot, "log": log,
-                }).eq("id", step_ids[i]).execute()
+            # Store the full trace on EVERY step (pass or fail) so the UI/DB shows
+            # exactly what the agent did — not just failures.
+            sb.table("run_steps").update({
+                "status": "passed" if ok else "failed",
+                "ended_at": _now(), "screenshot_url": shot, "log": log,
+            }).eq("id", step_ids[i]).execute()
+            if not ok:
                 outcome = "failed"
                 break
+    finally:
+        drv.stop()
 
     summary = "Todos los pasos aprobados" if outcome == "passed" else f"Terminó con estado {outcome}"
     sb.table("run_specs").update({
@@ -169,57 +173,79 @@ def run_spec(sb, dp, region, browser_id, memory_id, run_spec, company_actor, ses
 import re
 
 
-REPORT_PROMPT = """Eres un ingeniero de QA. Genera un informe claro y accionable de esta \
-ejecución de prueba, en español y en Markdown, útil tanto para el equipo de DESARROLLO \
-como para el de PRODUCTO. No inventes información: básate solo en los pasos y resultados dados.
-
-Caso de prueba: {title}
-Resultado final: {outcome}
-Pasos ejecutados:
+# Simple, short prompt — less load on the model (helps with throttling) while
+# still producing a useful dev+product summary.
+REPORT_PROMPT = """Genera un informe breve de QA en español y Markdown a partir de estos datos. \
+No inventes nada. Caso: {title}. Resultado: {outcome}.
+Pasos:
 {steps}
 
-Usa exactamente estas secciones (omite "Hallazgo" si el resultado fue aprobado):
+Responde con:
 ## Resumen
-Una o dos frases en lenguaje de producto: qué se probó y el resultado.
-## Qué se validó
-Viñetas concretas de lo que el agente comprobó paso a paso.
-## Hallazgo
-- **Impacto (producto):** el efecto para el usuario/negocio.
-- **Detalle técnico (desarrollo):** dónde y por qué falló.
-- **Pasos para reproducir:** lista numerada.
-- **Evidencia:** el paso exacto y el mensaje observado.
-
-Sé conciso pero completo."""
+1-2 frases: qué se probó y el resultado.
+## Detalle
+Viñetas de lo que pasó en cada paso (y dónde falló, si aplica)."""
 
 
 def generate_report(region: str, model_id: str, title: str, executed: list[dict], outcome: str) -> str | None:
-    """Ask the model for a detailed dev+product QA report of the run. Best-effort."""
+    """Ask the model for a short dev+product QA report. Best-effort, but loud on error."""
     if not executed:
+        print("[report] no executed steps, skipping", flush=True)
         return None
     steps_txt = "\n".join(
         f"{i + 1}. [{s['status']}] {s['description']}" + (f" — {s['log']}" if s.get("log") else "")
         for i, s in enumerate(executed)
     )
+    prompt = REPORT_PROMPT.format(title=title, outcome=outcome, steps=steps_txt)
+
+    # Prefer the Anthropic Claude API directly when a key is set (own quota,
+    # avoids Bedrock's per-day token cap). Fall back to Bedrock otherwise.
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        try:
+            import anthropic
+            anth_id = "claude-haiku-4-5"
+            for k in ("claude-sonnet-4-6", "claude-sonnet-4-5", "claude-opus-4-7", "claude-haiku-4-5"):
+                if k in (model_id or ""):
+                    anth_id = k
+                    break
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model=anth_id, max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            report = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            print(f"[report] generated via Anthropic API ({len(report)} chars)", flush=True)
+            return report
+        except Exception as e:
+            print(f"[report] Anthropic API failed ({type(e).__name__}): {e}", flush=True)
+            return None
+
+    # Adaptive retries so transient ThrottlingException doesn't lose the report.
+    from botocore.config import Config
+    rt = boto3.client("bedrock-runtime", region_name=region,
+                      config=Config(retries={"max_attempts": 4, "mode": "adaptive"}))
     try:
-        rt = boto3.client("bedrock-runtime", region_name=region)
         resp = rt.converse(
             modelId=model_id,
-            messages=[{"role": "user", "content": [
-                {"text": REPORT_PROMPT.format(title=title, outcome=outcome, steps=steps_txt)},
-            ]}],
-            inferenceConfig={"maxTokens": 800, "temperature": 0.2},
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 600, "temperature": 0.2},
         )
-        return resp["output"]["message"]["content"][0]["text"].strip()
+        report = resp["output"]["message"]["content"][0]["text"].strip()
+        print(f"[report] generated via Bedrock ({len(report)} chars)", flush=True)
+        return report
     except Exception as e:
-        print(f"[report] generation skipped: {e}")
+        # Loud, typed error so we can actually see WHY (AccessDenied, Throttling…).
+        print(f"[report] Bedrock FAILED ({type(e).__name__}): {e}", flush=True)
         return None
 
 
-def run_one_step(page, instruction: str, model_id: str, region: str) -> tuple[bool, str | None]:
+def run_one_step(drv, instruction: str, model_id: str, region: str) -> tuple[bool, str | None]:
     """
-    Execute one NL step. Uses the Strands agent (selected Bedrock model drives the
-    browser via tools) unless AGENT_EXECUTOR=heuristic; falls back to the
-    deterministic executor on any error. Returns (ok, log).
+    Execute one NL step. Uses the Strands agent (selected model drives the browser
+    via tools) unless AGENT_EXECUTOR=heuristic; falls back to the deterministic
+    executor on any error. `drv` is a PWDriver; all page ops go through drv.call.
+    Returns (ok, log).
     """
     mode = os.environ.get("AGENT_EXECUTOR", "strands")
     if mode != "heuristic":
@@ -227,17 +253,17 @@ def run_one_step(page, instruction: str, model_id: str, region: str) -> tuple[bo
             from strands_executor import execute_step as strands_execute
             # Instructions are baked into this agent's runtime via env (per-agent runtime).
             extra = os.environ.get("AGENT_INSTRUCTIONS", "")
-            return strands_execute(page, instruction, model_id, region, extra)
+            return strands_execute(drv.call, instruction, model_id, region, extra)
         except Exception as e:
-            print(f"[strands] fell back to heuristic: {type(e).__name__}: {e}")
-    # Deterministic fallback.
+            print(f"[strands] fell back to heuristic: {type(e).__name__}: {e}", flush=True)
+    # Deterministic fallback (runs on the driver thread).
     try:
-        _execute_step(page, instruction)
-        return True, None
+        drv.call(lambda page: _execute_step(page, instruction))
+        return True, "heurístico: OK"
     except AssertionError as ae:
-        return False, str(ae)
+        return False, f"heurístico: {ae}"
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"heurístico: {type(e).__name__}: {e}"
 
 
 def _quoted(text: str):
@@ -358,9 +384,9 @@ def _click(page, label: str) -> bool:
     return False
 
 
-def _screenshot(page, sb, spec_id, idx) -> str | None:
+def _screenshot(drv, sb, spec_id, idx) -> str | None:
     try:
-        png = page.screenshot(type="png")
+        png = drv.call(lambda page: page.screenshot(type="png"))
         path = f"{spec_id}/{idx}.png"
         sb.storage.from_("run-shots").upload(
             path, png, {"content-type": "image/png", "upsert": "true"}
