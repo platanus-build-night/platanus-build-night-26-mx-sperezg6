@@ -125,6 +125,21 @@ export async function createFeatureAction(
   return ok;
 }
 
+/**
+ * Deletes a feature and all of its test specs. Also clears the
+ * `default_feature_id` of any agent that targeted it so no dangling reference
+ * remains (the agent stays, it just loses its target). Children are removed
+ * explicitly so this works regardless of DB cascade configuration.
+ */
+export async function deleteFeatureAction(featureId: string, appId?: string): Promise<void> {
+  const sb = createServerSupabase();
+  await sb.from("agents").update({ default_feature_id: null }).eq("default_feature_id", featureId);
+  await sb.from("test_specs").delete().eq("feature_id", featureId);
+  await sb.from("features").delete().eq("id", featureId);
+  if (appId) revalidatePath(`/apps/${appId}`);
+  revalidatePath("/apps");
+}
+
 // ── Test specs (NL steps, one per line) ───────────────────────────────────────
 const testSpecSchema = z.object({
   feature_id: z.string().uuid(),
@@ -161,6 +176,55 @@ export async function createTestSpecAction(
   if (error) return fail(error.message);
   revalidatePath(`/apps`);
   return ok;
+}
+
+const updateTestSpecSchema = z.object({
+  id: z.string().uuid(),
+  app_id: z.string().optional(),
+  title: z.string().min(1, "El título es obligatorio"),
+  steps: z.string().min(1, "Agrega al menos un paso"),
+});
+
+/**
+ * Updates a test spec's title and steps. Lets you refine the natural-language
+ * steps when the agent isn't following them correctly, then re-run.
+ */
+export async function updateTestSpecAction(
+  _prev: ActionState,
+  fd: FormData,
+): Promise<ActionState> {
+  const parsed = updateTestSpecSchema.safeParse({
+    id: str(fd, "id"),
+    app_id: str(fd, "app_id"),
+    title: str(fd, "title"),
+    steps: str(fd, "steps"),
+  });
+  if (!parsed.success) return fail(parsed.error.issues[0].message);
+
+  const steps_json = parsed.data.steps
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((description) => ({ description }));
+  if (steps_json.length === 0) return fail("Agrega al menos un paso");
+
+  const sb = createServerSupabase();
+  const { error } = await sb
+    .from("test_specs")
+    .update({ title: parsed.data.title, steps_json })
+    .eq("id", parsed.data.id);
+  if (error) return fail(error.message);
+  if (parsed.data.app_id) revalidatePath(`/apps/${parsed.data.app_id}`);
+  revalidatePath("/apps");
+  return ok;
+}
+
+/** Deletes a single test spec. `appId` lets us revalidate the app detail page. */
+export async function deleteTestSpecAction(specId: string, appId?: string): Promise<void> {
+  const sb = createServerSupabase();
+  await sb.from("test_specs").delete().eq("id", specId);
+  if (appId) revalidatePath(`/apps/${appId}`);
+  revalidatePath("/apps");
 }
 
 // ── Agents ────────────────────────────────────────────────────────────────────

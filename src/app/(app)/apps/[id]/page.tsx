@@ -5,6 +5,9 @@ import { Topbar } from "@/components/shell/Topbar";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { CreateFeatureDialog } from "@/components/forms/CreateFeatureDialog";
 import { CreateTestSpecDialog } from "@/components/forms/CreateTestSpecDialog";
+import { DeleteFeatureButton } from "@/components/forms/DeleteFeatureButton";
+import { DeleteTestSpecButton } from "@/components/forms/DeleteTestSpecButton";
+import { EditTestSpecDialog } from "@/components/forms/EditTestSpecDialog";
 import { getApp, getFeatures, getTestSpecs } from "@/lib/data";
 
 export default async function AppDetailPage({
@@ -58,7 +61,10 @@ export default async function AppDetailPage({
                         <p className="mt-0.5 text-sm text-mute">{f.description}</p>
                       )}
                     </div>
-                    <CreateTestSpecDialog featureId={f.id} />
+                    <div className="flex items-center gap-1">
+                      <CreateTestSpecDialog featureId={f.id} />
+                      <DeleteFeatureButton featureId={f.id} featureName={f.name} appId={id} />
+                    </div>
                   </div>
 
                   {specs.length === 0 ? (
@@ -74,6 +80,13 @@ export default async function AppDetailPage({
                           <span className="text-mono text-[11px] uppercase tracking-wide text-faint">
                             {s.steps_json.length} pasos
                           </span>
+                          <EditTestSpecDialog
+                            specId={s.id}
+                            appId={id}
+                            title={s.title}
+                            steps={s.steps_json.map((st) => st.description).join("\n")}
+                          />
+                          <DeleteTestSpecButton specId={s.id} specTitle={s.title} appId={id} />
                         </li>
                       ))}
                     </ul>
